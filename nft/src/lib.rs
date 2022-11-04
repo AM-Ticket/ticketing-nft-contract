@@ -151,7 +151,8 @@ impl Contract {
 
         assert_eq!(token.owner_id, caller_id, "Error: Token not owned by the caller");
 
-        token_metadata.extra = Some(json!({"attributes": {"redeemed": "false"}}).to_string());
+        assert_eq!(token_metadata.extra, Some(json!({"attributes": {"redeemed": "false"}}).to_string()));
+        token_metadata.extra = Some(json!({"attributes": {"redeemed": "true"}}).to_string());
 
         self.tokens.token_metadata_by_id.as_mut().unwrap().insert(&token_id, &token_metadata);
 
