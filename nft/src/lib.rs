@@ -20,17 +20,24 @@ use near_contract_standards::non_fungible_token::metadata::{
 };
 use near_contract_standards::non_fungible_token::{Token, TokenId};
 use near_contract_standards::non_fungible_token::NonFungibleToken;
+use near_sdk::assert_one_yocto;
 use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
 use near_sdk::collections::LazyOption;
+use near_sdk::json_types::U128;
 use near_sdk::{
     env, near_bindgen, AccountId, BorshStorageKey, PanicOnDefault, Promise, PromiseOrValue,
+    serde_json::json
 };
+
 
 #[near_bindgen]
 #[derive(BorshDeserialize, BorshSerialize, PanicOnDefault)]
 pub struct Contract {
     tokens: NonFungibleToken,
     metadata: LazyOption<NFTContractMetadata>,
+    token_metadata: TokenMetadata,
+    minted_tokens: u64,
+    minting_price: u128
 }
 
 const DATA_IMAGE_SVG_NEAR_ICON: &str = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 288 288'%3E%3Cg id='l' data-name='l'%3E%3Cpath d='M187.58,79.81l-30.1,44.69a3.2,3.2,0,0,0,4.75,4.2L191.86,103a1.2,1.2,0,0,1,2,.91v80.46a1.2,1.2,0,0,1-2.12.77L102.18,77.93A15.35,15.35,0,0,0,90.47,72.5H87.34A15.34,15.34,0,0,0,72,87.84V201.16A15.34,15.34,0,0,0,87.34,216.5h0a15.35,15.35,0,0,0,13.08-7.31l30.1-44.69a3.2,3.2,0,0,0-4.75-4.2L96.14,186a1.2,1.2,0,0,1-2-.91V104.61a1.2,1.2,0,0,1,2.12-.77l89.55,107.23a15.35,15.35,0,0,0,11.71,5.43h3.13A15.34,15.34,0,0,0,216,201.16V87.84A15.34,15.34,0,0,0,200.66,72.5h0A15.35,15.35,0,0,0,187.58,79.81Z'/%3E%3C/g%3E%3C/svg%3E";
@@ -61,11 +68,26 @@ impl Contract {
                 reference: None,
                 reference_hash: None,
             },
+            TokenMetadata { 
+                title:  Some("Ticket to paradise".to_string()), 
+                description: None, 
+                media: Some("https://ipfs.io/ipfs/bafybeighxr7dvxnugqiesff3caszpp6nxznjkhieqyglbelg4tcy2b5a3a".to_string()), 
+                media_hash: None, 
+                copies: Some(100), 
+                issued_at: None, 
+                expires_at: None, 
+                starts_at: None, 
+                updated_at: None, 
+                extra: None,
+                reference: None, 
+                reference_hash: None
+            },
+            U128::from(10u128.pow(24))
         )
     }
 
     #[init]
-    pub fn new(owner_id: AccountId, metadata: NFTContractMetadata) -> Self {
+    pub fn new(owner_id: AccountId, metadata: NFTContractMetadata, token_metadata: TokenMetadata, minting_price: U128) -> Self {
         assert!(!env::state_exists(), "Already initialized");
         metadata.assert_valid();
         Self {
@@ -77,25 +99,67 @@ impl Contract {
                 Some(StorageKey::Approval),
             ),
             metadata: LazyOption::new(StorageKey::Metadata, Some(&metadata)),
+            token_metadata,
+            minted_tokens: 0,
+            minting_price: minting_price.0,
         }
     }
 
-    /// Mint a new token with ID=`token_id` belonging to `receiver_id`.
-    ///
-    /// Since this example implements metadata, it also requires per-token metadata to be provided
-    /// in this call. `self.tokens.mint` will also require it to be Some, since
-    /// `StorageKey::TokenMetadata` was provided at initialization.
-    ///
-    /// `self.tokens.mint` will enforce `predecessor_account_id` to equal the `owner_id` given in
-    /// initialization call to `new`.
     #[payable]
-    pub fn nft_mint(
+    pub fn nft_buy(
         &mut self,
-        token_id: TokenId,
-        receiver_id: AccountId,
-        token_metadata: TokenMetadata,
     ) -> Token {
-        self.tokens.mint(token_id, receiver_id, Some(token_metadata))
+        let caller_id = env::predecessor_account_id();
+        let attached_deposit = env::attached_deposit();
+        assert!(attached_deposit == self.minting_price);
+
+
+        assert!(self.minted_tokens < self.token_metadata.copies.unwrap(), "Error: Sold out");
+        let token_id = self.minted_tokens + 1;
+        self.minted_tokens += 1;
+
+        self.tokens.internal_mint(token_id.to_string(), caller_id, Some(
+                TokenMetadata { 
+                    title:  self.token_metadata.title.clone(), 
+                    description: self.token_metadata.description.clone(), 
+                    media: self.token_metadata.media.clone(), 
+                    media_hash: self.token_metadata.media_hash.clone(), 
+                    copies: self.token_metadata.copies, 
+                    issued_at: self.token_metadata.issued_at.clone(), 
+                    expires_at: self.token_metadata.expires_at.clone(), 
+                    starts_at: self.token_metadata.starts_at.clone(), 
+                    updated_at: self.token_metadata.updated_at.clone(), 
+                    extra: Some(json!({"attributes": {"redeemed": "false"}}).to_string()),
+                    reference: self.token_metadata.reference.clone(), 
+                    reference_hash: self.token_metadata.reference_hash.clone() 
+                }
+            )
+        )
+    }
+
+    #[payable]
+    pub fn redeem_nft(
+        &mut self,
+        token_id: TokenId
+    ) -> Token {
+        assert_one_yocto();
+        let caller_id = env::predecessor_account_id();
+
+        // let token_metadata = self.tokens.token_metadata_by_id.unwrap().get(&token_id).unwrap();
+        let mut token = self.nft_token(token_id.clone()).unwrap();
+        let mut token_metadata = token.metadata.as_mut().unwrap();
+
+        assert_eq!(token.owner_id, caller_id, "Error: Token not owned by the caller");
+
+        token_metadata.extra = Some(json!({"attributes": {"redeemed": "false"}}).to_string());
+
+        self.tokens.token_metadata_by_id.as_mut().unwrap().insert(&token_id, &token_metadata);
+
+        token
+    }
+
+    pub fn tokens_left(&self) -> u64 {
+        self.token_metadata.copies.unwrap() - self.minted_tokens
     }
 }
 
@@ -176,11 +240,6 @@ mod tests {
             .build());
 
         let token_id = "0".to_string();
-        let token = contract.nft_mint(token_id.clone(), accounts(0), sample_token_metadata());
-        assert_eq!(token.token_id, token_id);
-        assert_eq!(token.owner_id.to_string(), accounts(0).to_string());
-        assert_eq!(token.metadata.unwrap(), sample_token_metadata());
-        assert_eq!(token.approved_account_ids.unwrap(), HashMap::new());
     }
 
     #[test]
