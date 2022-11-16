@@ -15,20 +15,28 @@ NOTES:
   - To prevent the deployed contract from being modified or deleted, it should not have any access
     keys on its account.
 */
+use std::collections::HashMap;
+
 use near_contract_standards::non_fungible_token::metadata::{
     NFTContractMetadata, NonFungibleTokenMetadataProvider, TokenMetadata, NFT_METADATA_SPEC,
 };
-use near_contract_standards::non_fungible_token::{Token, TokenId};
+use near_contract_standards::non_fungible_token::{Token, TokenId, bytes_for_approved_account_id};
 use near_contract_standards::non_fungible_token::NonFungibleToken;
-use near_sdk::assert_one_yocto;
+use near_sdk::{assert_one_yocto, Balance};
 use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
 use near_sdk::collections::LazyOption;
 use near_sdk::json_types::U128;
+use near_sdk::serde::{Serialize, Deserialize};
 use near_sdk::{
     env, near_bindgen, AccountId, BorshStorageKey, PanicOnDefault, Promise, PromiseOrValue,
     serde_json::json
 };
 
+#[derive(Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct Payout {
+    pub payout: HashMap<AccountId, U128>,
+} 
 
 #[near_bindgen]
 #[derive(BorshDeserialize, BorshSerialize, PanicOnDefault)]
@@ -37,7 +45,8 @@ pub struct Contract {
     metadata: LazyOption<NFTContractMetadata>,
     token_metadata: TokenMetadata,
     minted_tokens: u64,
-    minting_price: u128
+    minting_price: u128,
+    perpetual_royalties: Option<HashMap<AccountId, u32>>
 }
 
 const DATA_IMAGE_SVG_NEAR_ICON: &str = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 288 288'%3E%3Cg id='l' data-name='l'%3E%3Cpath d='M187.58,79.81l-30.1,44.69a3.2,3.2,0,0,0,4.75,4.2L191.86,103a1.2,1.2,0,0,1,2,.91v80.46a1.2,1.2,0,0,1-2.12.77L102.18,77.93A15.35,15.35,0,0,0,90.47,72.5H87.34A15.34,15.34,0,0,0,72,87.84V201.16A15.34,15.34,0,0,0,87.34,216.5h0a15.35,15.35,0,0,0,13.08-7.31l30.1-44.69a3.2,3.2,0,0,0-4.75-4.2L96.14,186a1.2,1.2,0,0,1-2-.91V104.61a1.2,1.2,0,0,1,2.12-.77l89.55,107.23a15.35,15.35,0,0,0,11.71,5.43h3.13A15.34,15.34,0,0,0,216,201.16V87.84A15.34,15.34,0,0,0,200.66,72.5h0A15.35,15.35,0,0,0,187.58,79.81Z'/%3E%3C/g%3E%3C/svg%3E";
@@ -82,12 +91,13 @@ impl Contract {
                 reference: None, 
                 reference_hash: None
             },
-            U128::from(10u128.pow(24))
+            U128::from(10u128.pow(24)),
+            None
         )
     }
 
     #[init]
-    pub fn new(owner_id: AccountId, metadata: NFTContractMetadata, token_metadata: TokenMetadata, minting_price: U128) -> Self {
+    pub fn new(owner_id: AccountId, metadata: NFTContractMetadata, token_metadata: TokenMetadata, minting_price: U128, perpetual_royalties: Option<HashMap<AccountId, u32>>) -> Self {
         assert!(!env::state_exists(), "Already initialized");
         metadata.assert_valid();
         Self {
@@ -102,6 +112,7 @@ impl Contract {
             token_metadata,
             minted_tokens: 0,
             minting_price: minting_price.0,
+            perpetual_royalties: perpetual_royalties,
         }
     }
 
@@ -129,7 +140,7 @@ impl Contract {
                     expires_at: self.token_metadata.expires_at.clone(), 
                     starts_at: self.token_metadata.starts_at.clone(), 
                     updated_at: self.token_metadata.updated_at.clone(), 
-                    extra: Some(json!({"attributes": {"redeemed": "false"}}).to_string()),
+                    extra: Some(json!({"attributes": [{"trait_type": "redeemed", "value": "false"}]}).to_string()),
                     reference: self.token_metadata.reference.clone(), 
                     reference_hash: self.token_metadata.reference_hash.clone() 
                 }
@@ -151,8 +162,8 @@ impl Contract {
 
         assert_eq!(token.owner_id, caller_id, "Error: Token not owned by the caller");
 
-        assert_eq!(token_metadata.extra, Some(json!({"attributes": {"redeemed": "false"}}).to_string()));
-        token_metadata.extra = Some(json!({"attributes": {"redeemed": "true"}}).to_string());
+        assert_eq!(token_metadata.extra, Some(json!({"attributes": [{"trait_type": "redeemed", "value": "false"}]}).to_string()));
+        token_metadata.extra = Some(json!({"attributes": [{"trait_type": "redeemed", "value": "true"}]}).to_string());
 
         self.tokens.token_metadata_by_id.as_mut().unwrap().insert(&token_id, &token_metadata);
 
@@ -162,7 +173,112 @@ impl Contract {
     pub fn tokens_left(&self) -> u64 {
         self.token_metadata.copies.unwrap() - self.minted_tokens
     }
+
+    pub fn nft_payout(&self, token_id: TokenId, balance: U128, max_len_payout: u32) -> Payout {
+		let token = self.tokens.nft_token(token_id).expect("Error: No token_id found");
+
+        let owner_id = token.owner_id;
+        let mut total_perpetual = 0;
+        let balance_u128 = u128::from(balance);
+        let mut payout_object = Payout {
+            payout: HashMap::new()
+        };
+
+        if let Some(royalties) = &self.perpetual_royalties {
+		    assert!(royalties.len() as u32 <= max_len_payout, "Market cannot payout to that many receivers");
+
+		    for (k, v) in royalties.iter() {
+		    	let key = k.clone();
+		    	if key != owner_id {
+                    //
+		    		payout_object.payout.insert(key, royalty_to_payout(*v, balance_u128));
+		    		total_perpetual += *v;
+		    	}
+		    }
+        }
+
+		payout_object.payout.insert(owner_id, royalty_to_payout(10000 - total_perpetual, balance_u128));
+
+		payout_object
+	}
+
+    //transfers the token to the receiver ID and returns the payout object that should be payed given the passed in balance. 
+    #[payable]
+    pub fn nft_transfer_payout(
+        &mut self,
+        receiver_id: AccountId,
+        token_id: TokenId,
+        approval_id: u64,
+        memo: Option<String>,
+        balance: U128,
+        max_len_payout: u32,
+    ) -> Payout { 
+        assert_one_yocto();
+        let sender_id = env::predecessor_account_id();
+        let (owner_id, approved_account_ids) = self.tokens.internal_transfer(
+            &sender_id,
+            &receiver_id,
+            &token_id,
+            Some(approval_id),
+            memo,
+        );
+
+        if let Some(approved_account_ids) = approved_account_ids {
+            refund_approved_account_ids(
+                owner_id.clone(),
+                &approved_account_ids,
+            );
+        }
+
+        let mut total_perpetual = 0;
+        let balance_u128 = u128::from(balance);
+        let mut payout_object = Payout {
+            payout: HashMap::new()
+        };
+
+        if let Some(royalties) = &self.perpetual_royalties {
+		    assert!(royalties.len() as u32 <= max_len_payout, "Market cannot payout to that many receivers");
+
+		    for (k, v) in royalties.iter() {
+		    	let key = k.clone();
+		    	if key != owner_id {
+		    		payout_object.payout.insert(key, royalty_to_payout(*v, balance_u128));
+		    		total_perpetual += *v;
+		    	}
+		    }
+        }
+
+		payout_object.payout.insert(owner_id, royalty_to_payout(10000 - total_perpetual, balance_u128));
+
+		payout_object
+    }
 }
+
+fn royalty_to_payout(royalty_percentage: u32, amount_to_pay: u128) -> U128 {
+    U128(royalty_percentage as u128 * amount_to_pay / 10_000u128)
+}
+
+fn refund_approved_account_ids_iter<'a, I>(
+    account_id: AccountId,
+    approved_account_ids: I, //the approved account IDs must be passed in as an iterator
+) -> Promise
+where
+    I: Iterator<Item = &'a AccountId>,
+{
+    //get the storage total by going through and summing all the bytes for each approved account IDs
+    let storage_released: u64 = approved_account_ids.map(bytes_for_approved_account_id).sum();
+    //transfer the account the storage that is released
+    Promise::new(account_id).transfer(Balance::from(storage_released) * env::storage_byte_cost())
+}
+
+fn refund_approved_account_ids(
+    account_id: AccountId,
+    approved_account_ids: &HashMap<AccountId, u64>,
+) -> Promise {
+    //call the refund_approved_account_ids_iter with the approved account IDs as keys
+    refund_approved_account_ids_iter(account_id, approved_account_ids.keys())
+}
+
 
 near_contract_standards::impl_non_fungible_token_core!(Contract, tokens);
 near_contract_standards::impl_non_fungible_token_approval!(Contract, tokens);
