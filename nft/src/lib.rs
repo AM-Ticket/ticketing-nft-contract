@@ -119,8 +119,14 @@ impl Contract {
     #[payable]
     pub fn nft_buy(
         &mut self,
+        receiver_id: Option<AccountId>
     ) -> Token {
         let caller_id = env::predecessor_account_id();
+        let receiver_id_final = if let Some(receiver_id) = receiver_id {
+            receiver_id
+        } else {
+            caller_id
+        };
         let attached_deposit = env::attached_deposit();
         assert!(attached_deposit == self.minting_price);
 
@@ -129,7 +135,7 @@ impl Contract {
         let token_id = self.minted_tokens + 1;
         self.minted_tokens += 1;
 
-        self.tokens.internal_mint(token_id.to_string(), caller_id, Some(
+        self.tokens.internal_mint(token_id.to_string(), receiver_id_final, Some(
                 TokenMetadata { 
                     title:  self.token_metadata.title.clone(), 
                     description: self.token_metadata.description.clone(), 
