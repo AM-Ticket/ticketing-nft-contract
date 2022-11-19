@@ -128,7 +128,7 @@ impl Contract {
             caller_id
         };
         let attached_deposit = env::attached_deposit();
-        assert!(attached_deposit == self.minting_price);
+        assert!(attached_deposit >= self.minting_price);
 
 
         assert!(self.minted_tokens < self.token_metadata.copies.unwrap(), "Error: Sold out");
